@@ -1,0 +1,33 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 打包产物（发布走 npm，不把 tgz/zip 提交进仓库）
+dist/
+*.tgz
+*.zip
+
+# 编辑/工具临时文件
+*.bak
+*.bak-*
+*.orig
+*.rej
+*.log
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地配置与密钥（绝不提交）
+.env
+.env.*
+*.key
+*.pem
+*.p12
+.breeze-key
+
+# 运行时数据（插件在用户机器上生成，不属于源码）
+mind/
+strand/
+*.local.json

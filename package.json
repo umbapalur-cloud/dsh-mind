@@ -1,0 +1,53 @@
+{
+  "name": "dsh-mind",
+  "version": "1.0.3",
+  "description": "记忆与在场统一层：把跨会话脉络（第三人称）、经验库（规范）、自身状态（第一人称）合成一个插件——一套状态、一条注入、一条推送、一个预算。整合自 dsh-strand + dsh-tacit + dsh-psyche。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "import": "./lib/index.js"
+    },
+    "./compaction": {
+      "import": "./lib/compaction.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "mind-cli": "./lib/cli.mjs"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "memory",
+    "cross-session",
+    "identity",
+    "presence",
+    "experience"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.1-rc.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node tests/regress.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-compaction-basic": "*",
+    "@deepseek-ai/dsh-llm": "*"
+  }
+}
