@@ -9,6 +9,30 @@
 
 ---
 
+## 📦 下载
+
+**最新版：[v1.0.3 Release](https://github.com/umbapalur-cloud/dsh-mind/releases/latest)**
+
+| 文件 | 大小 | 内容 | 用途 |
+|---|---|---|---|
+| [`dsh-mind-1.0.3.tgz`](https://github.com/umbapalur-cloud/dsh-mind/releases/download/v1.0.3/dsh-mind-1.0.3.tgz) | 110 KB | 20 个文件：`package.json` / `README.md` / `LICENSE` / `cordis.patch.yml` / `lib/**` | **正式分发**，`npm install <此文件>` |
+| [`dsh-mind-v1.0.3-20261112-182243.zip`](https://github.com/umbapalur-cloud/dsh-mind/releases/download/v1.0.3/dsh-mind-v1.0.3-20261112-182243.zip) | 227 KB | 上面 20 个 + `CHANGELOG.md` + `tests/`（6 个） | **完整源码快照**，含回归测试 |
+
+SHA256：
+
+```
+8AE0713397F9F214DE09CC112118BB6DA67CF6BC1FE365976ECA81B074F7ECAF  dsh-mind-1.0.3.tgz
+D802C2A663C266EF71DF69782BAF4FEAB940357C15BF2637E222748AF8FD8966  dsh-mind-v1.0.3-20261112-182243.zip
+```
+
+```powershell
+Get-FileHash .\dsh-mind-1.0.3.tgz -Algorithm SHA256
+```
+
+安装方式与依赖说明见 [Release 页](https://github.com/umbapalur-cloud/dsh-mind/releases/tag/v1.0.3)。
+
+---
+
 ## 它解决什么
 
 上下文一压缩，AI 就不知道自己是谁了。
