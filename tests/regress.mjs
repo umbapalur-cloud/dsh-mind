@@ -789,7 +789,10 @@ group('38 工具定义')
   check('★★ 不再注册 mind_recall', !names.includes('mind_recall'))
   check('★★ 不再注册 mind_forget', !names.includes('mind_forget'))
   check('★★ 不再注册 mind_keys', !names.includes('mind_keys'))
-  check('★ 工具数 = 6', defs.length === 6, String(defs.length))
+  // ⚠️ 2026-11-16：+mind_lifeline（月度生命索引）→ 6 变 7。
+  //   这不是"顺手放宽数字"，是**新增了一个功能入口**：
+  //   常驻索引只给每月一句，展开细节必须有工具，否则那一层是只写不读的死数据。
+  check('★ 工具数 = 7', defs.length === 7, String(defs.length))
   check('每个都有 description', defs.every((d) => typeof d.description === 'string' && d.description.length > 20))
   check('每个都有 parameters', defs.every((d) => d.parameters && typeof d.parameters === 'object'))
   check('每个都有 execute', defs.every((d) => typeof d.execute === 'function'))
@@ -1621,91 +1624,223 @@ group('60 ★ 存档路径必须跟随 MIND_DIR（测试隔离）')
 //   关键：**抛「已存在」其实等于注册成功**——名字确实在工具表里了。
 //
 //   注：这个 bug 在 04:33 那次启动就有，**不是本轮改动引入**，属历史遗留。
-group('59 ★ 工具注册幂等（「已存在」不算失败）')
+group('59 ★ 工具注册（行为级，驱动真实 lib/tool-register.js）')
 {
   resetData()
 
-  const src = readFileSync(join(ROOT, 'lib', 'index.js'), 'utf8')
-
-  // ① 必须有「已存在」识别函数
-  check('59-① 源码：有 isAlreadyRegistered 判定', src.includes('function isAlreadyRegistered'))
-  check('59-② 判据用正则匹配 already registered（不靠错误码）',
-    /\/already registered\/i\.test/.test(src))
-
-  // ①b 日志必须幂等（2026-11-05 真机：一次启动刷了 8 条一模一样的）
+  // ── 2026-11-20 重写 ──────────────────────────────────────────
   //
-  //   ⚠️ 女仆**没有**证明具体的重入机制（试过两种解释都不成立，不编原因）。
-  //   能确定的是这是纯日志噪声 —— 工具本身 7/7 注册成功。
-  //   所以修法是模块级闸门：跨闭包共享，不依赖任何时序假设。
-  check('59-①b 源码：有模块级日志闸门 TOOLS_REGISTERED_LOGGED',
-    src.includes('let TOOLS_REGISTERED_LOGGED = false'))
-  check('59-①c ★ 源码：「已注册」日志走闸门（不是裸 log）',
-    /if \(!TOOLS_REGISTERED_LOGGED\) \{[\s\S]{0,160}TOOLS_REGISTERED_LOGGED = true[\s\S]{0,160}log\(`mind_\* 工具已注册/.test(src))
-
-  // ①d 反向：证明 ①c 的判据有区分力
-  const brokenGate = src.replace(/if \(!TOOLS_REGISTERED_LOGGED\) \{/, 'if (true) {')
-  check('59-①d 反向：去掉闸门后 ①c 不再匹配',
-    !/if \(!TOOLS_REGISTERED_LOGGED\) \{[\s\S]{0,160}TOOLS_REGISTERED_LOGGED = true[\s\S]{0,160}log\(`mind_\* 工具已注册/.test(brokenGate))
-
-
-  // ③ 必须有 done 集合，跳过已成功的名字
-  check('59-③ 源码：有 done 集合去重', src.includes('const done = new Set()'))
-  check('59-④ 源码：循环里先查 done 再 register', /if \(done\.has\(def\?\.name\)\)/.test(src))
-  check('59-⑤ 源码：成功后记进 done', /done\.add\(def\.name\)/.test(src))
-
-  // ⑥ 关键：已存在时**不写日志**（否则刷屏就是它）
-  check('59-⑥ ★ 源码：已存在时不写「工具注册失败」',
-    /if \(isAlreadyRegistered\(e\)\) \{[\s\S]{0,200}done\.add\(def\?\.name\)[\s\S]{0,80}n\+\+/.test(src))
-
-  // ⑦ 反向：证明上面的正则真有区分力
-  const broken = src.replace(/if \(isAlreadyRegistered\(e\)\) \{/, 'if (false) {')
-  check('59-⑦ 反向：去掉已存在分支后正则不再匹配',
-    !/if \(isAlreadyRegistered\(e\)\) \{[\s\S]{0,200}done\.add\(def\?\.name\)/.test(broken))
-
-  // ⑧ 行为级：模拟一个「已存在就抛错」的 tools 服务
+  // ⚠️ 这一组原来是「假绿」：
+  //   ① 前 7 条用 readFileSync + 正则匹配 index.js 的**源码文本**
+  //      → 改个变量名就红，逻辑改错不红；
+  //   ② 后 3 条行为级测试，测的是**在本文件里重新手写的循环副本**，
+  //      跟 index.js 里真实的 tryRegisterTools() 毫无绑定
+  //      → index.js 改坏了它照样绿。
   //
-  //   这是真正的判据 —— 源码正则会漂，行为不会。
-  const registry = new Map()
-  let thrown = 0
-  const fakeTools = {
-    register(def) {
-      if (registry.has(def.name)) {
-        thrown++
-        throw new Error(`tool "${def.name}" is already registered`)
-      }
-      registry.set(def.name, def)
-      return () => registry.delete(def.name)
-    },
-  }
+  //   根因是那段逻辑内联在 apply() 闭包里，外部根本拿不到。
+  //   修法：把它抽成 lib/tool-register.js，这里直接 import 真模块喂假 ctx。
+  //
+  //   本组现在测的两个 bug（2026-11-20 评审确认）：
+  //     bug ① 部分成功即全部成功 → 失败的工具永久缺失
+  //     bug ② 未就绪也消耗 attempts → 10 秒后永久放弃且无日志
 
-  function isAlreadyRegistered(e) {
-    return /already registered/i.test(String(e?.message ?? e))
-  }
-  const done = new Set()
-  let lastN = 0
-  for (let round = 0; round < 3; round++) {
-    let n = 0
-    for (const def of [{ name: 'a' }, { name: 'b' }, { name: 'c' }]) {
-      if (done.has(def.name)) {
-        n++
-        continue
-      }
-      try {
-        fakeTools.register(def)
-        done.add(def.name)
-        n++
-      } catch (e) {
-        if (isAlreadyRegistered(e)) {
-          done.add(def.name)
-          n++
-        }
-      }
+  const tr = await import(`file:///${join(ROOT, 'lib', 'tool-register.js').split('\\').join('/')}?t=${Date.now()}`)
+
+  /** 造一个假的 tools 服务：记录每次真正 register 的调用，可按名字指定抛错。 */
+  function makeFakeTools({ failFor = new Map(), preRegistered = [] } = {}) {
+    const registry = new Map()
+    const calls = []           // 每次 register 尝试的名字（含失败的）
+    for (const n of preRegistered) registry.set(n, { name: n })
+    return {
+      registry,
+      calls,
+      register(def) {
+        calls.push(def.name)
+        if (registry.has(def.name)) throw new Error(`tool "${def.name}" is already registered`)
+        const f = failFor.get(def.name)
+        if (f) throw f
+        registry.set(def.name, def)
+        return () => registry.delete(def.name)
+      },
     }
-    lastN = n
   }
-  check('59-⑧ ★ 行为：三轮之后仍报全量 n=3', lastN === 3, String(lastN))
-  check('59-⑨ ★ 行为：第二、三轮不再真的去 register（thrown=0）', thrown === 0, String(thrown))
-  check('59-⑩ 行为：工具表里是 3 个', registry.size === 3, String(registry.size))
+
+  /** 造一个假 ctx：ctx.get('tools') 返回 tools（或 null 模拟未就绪）。 */
+  function makeFakeCtx(toolsRef) {
+    const effects = []
+    const listeners = new Map()
+    return {
+      effects,
+      listeners,
+      get(name) {
+        if (name !== 'tools') return undefined
+        return typeof toolsRef.value === 'undefined' ? undefined : toolsRef.value
+      },
+      effect(fn) {
+        effects.push(fn)
+      },
+      on(name, fn) {
+        if (!listeners.has(name)) listeners.set(name, [])
+        listeners.get(name).push(fn)
+      },
+    }
+  }
+
+  const DEFS = [{ name: 'a' }, { name: 'b' }, { name: 'c' }]
+
+  // ── 基准：一次全成功 ──────────────────────────────────────
+  {
+    const tools = makeFakeTools()
+    const ctx = makeFakeCtx({ value: tools })
+    const logs = []
+    const r = tr.createToolRegistrar({
+      ctx, log: (m) => logs.push(m), makeDefinitions: () => DEFS,
+    })
+    r.tick()
+    const st = r.state()
+    check('59-① ★★ 一次全成功时立刻 completed', st.completed === true && st.status === 'complete', JSON.stringify(st))
+    check('59-② 全部 3 个都进了工具表', tools.registry.size === 3, String(tools.registry.size))
+    check('59-③ 完成日志写了真实数量 3/3', logs.some((l) => /已注册 :: 3\/3 个/.test(l)), logs.join('|'))
+  }
+
+  // ── bug ①：部分失败不能算完成 ─────────────────────────────
+  {
+    const fail = new Map([['b', new Error('boom')]])
+    const tools = makeFakeTools({ failFor: fail })
+    const ctx = makeFakeCtx({ value: tools })
+    const logs = []
+    const r = tr.createToolRegistrar({
+      ctx, log: (m) => logs.push(m), makeDefinitions: () => DEFS,
+    })
+    r.tick()
+    let st = r.state()
+    check('59-④ ★★★ bug①：1 个失败时 NOT completed', st.completed === false, JSON.stringify(st))
+    check('59-⑤ ★★★ bug①：missing 精确指出是 b', st.missing.length === 1 && st.missing[0] === 'b', JSON.stringify(st.missing))
+    check('59-⑥ ★★ bug①：成功的 a/c 已记账（不会重复注册）',
+      st.done.includes('a') && st.done.includes('c'), JSON.stringify(st.done))
+    check('59-⑦ 状态是 partial 且不写「已注册」日志',
+      st.status === 'partial' && !logs.some((l) => /已注册 ::/.test(l)), st.status)
+
+    // 恢复：b 不再失败，下一轮应补上
+    fail.delete('b')
+    const beforeCalls = tools.calls.length
+    r.tick()
+    st = r.state()
+    check('59-⑧ ★★★ bug①：恢复后补注册 b 并完成', st.completed === true && tools.registry.has('b'), JSON.stringify(st))
+    check('59-⑨ ★★ 补注册时只碰 b，不重复 a/c',
+      tools.calls.slice(beforeCalls).join(',') === 'b', tools.calls.slice(beforeCalls).join(','))
+  }
+
+  // ── bug ②：工具服务未就绪不消耗注册次数 ───────────────────
+  {
+    const toolsRef = { value: null }   // 一开始没有 tools 服务
+    const ctx = makeFakeCtx(toolsRef)
+    const logs = []
+    const r = tr.createToolRegistrar({
+      ctx, log: (m) => logs.push(m), makeDefinitions: () => DEFS,
+    })
+    // 空转 50 轮，远超默认 maxAttempts=20
+    for (let i = 0; i < 50; i++) r.tick()
+    let st = r.state()
+    check('59-⑩ ★★★ bug②：未就绪 50 轮后 attempts 仍为 0', st.attempts === 0, String(st.attempts))
+    check('59-⑪ ★★★ bug②：未就绪 50 轮后没有放弃', st.gaveUp === false, JSON.stringify(st))
+    check('59-⑫ 上述空转全程没有写「放弃」日志',
+      !logs.some((l) => /放弃/.test(l)), logs.join('|'))
+
+    // 服务终于就绪：应该能正常注册
+    toolsRef.value = makeFakeTools()
+    r.tick()
+    st = r.state()
+    check('59-⑬ ★★★ bug②：服务晚到仍能注册完（旧代码此时已永久放弃）',
+      st.completed === true && st.attempts === 1, JSON.stringify(st))
+  }
+
+  // ── 未就绪也有上限，且放弃时写清名单 ───────────────────────
+  {
+    const ctx = makeFakeCtx({ value: null })
+    const logs = []
+    const r = tr.createToolRegistrar({
+      ctx, log: (m) => logs.push(m), makeDefinitions: () => DEFS,
+      maxNotReadyAttempts: 3,
+    })
+    for (let i = 0; i < 5; i++) r.tick()
+    const st = r.state()
+    check('59-⑭ ★★ 未就绪达上限后放弃', st.gaveUp === true && st.status === 'gave-up', JSON.stringify(st))
+    check('59-⑮ ★★ 放弃日志写明缺失名单',
+      logs.some((l) => /始终未就绪/.test(l) && /a, b, c/.test(l)), logs.join('|'))
+    check('59-⑯ 放弃后不再尝试（attempts 保持 0）', st.attempts === 0, String(st.attempts))
+  }
+
+  // ── 「已存在」算成功，且不刷失败日志 ───────────────────────
+  {
+    const tools = makeFakeTools({ preRegistered: ['a', 'b', 'c'] })
+    const ctx = makeFakeCtx({ value: tools })
+    const logs = []
+    const r = tr.createToolRegistrar({
+      ctx, log: (m) => logs.push(m), makeDefinitions: () => DEFS,
+    })
+    r.tick()
+    const st = r.state()
+    check('59-⑰ ★★ 全部「已存在」时算完成', st.completed === true, JSON.stringify(st))
+    check('59-⑱ ★★ 「已存在」不写失败日志',
+      !logs.some((l) => /工具注册失败/.test(l)), logs.join('|'))
+    // 再跑一轮：不应再去 register
+    const before = tools.calls.length
+    r.tick()
+    check('59-⑲ ★★ 完成后 tick 是空操作', tools.calls.length === before, `${before}->${tools.calls.length}`)
+  }
+
+  // ── 真失败达到上限：写清缺谁 ─────────────────────────────
+  {
+    const fail = new Map([['b', new Error('always boom')]])
+    const tools = makeFakeTools({ failFor: fail })
+    const ctx = makeFakeCtx({ value: tools })
+    const logs = []
+    const r = tr.createToolRegistrar({
+      ctx, log: (m) => logs.push(m), makeDefinitions: () => DEFS, maxAttempts: 3,
+    })
+    for (let i = 0; i < 6; i++) r.tick()
+    const st = r.state()
+    check('59-⑳ ★★★ 真失败达上限后放弃', st.gaveUp === true, JSON.stringify(st))
+    check('59-㉑ ★★★ 放弃日志写出具体缺失名 b',
+      logs.some((l) => /仍 未注册 1 个|仍未注册 1 个/.test(l) && /\bb\b/.test(l)), logs.join('|'))
+    check('59-㉒ ★★ 放弃后不再无限重试', st.attempts === 3, String(st.attempts))
+  }
+
+  // ── 卸载清理：定时器被 effect 收走 ─────────────────────────
+  {
+    const toolsRef = { value: null }   // 一直未就绪 → 会挂轮询
+    const ctx = makeFakeCtx(toolsRef)
+    const r = tr.createToolRegistrar({
+      ctx, log: () => {}, makeDefinitions: () => DEFS, maxNotReadyAttempts: 1e9,
+    })
+    r.start({ pollMs: 500 })
+    const timerRegistered = ctx.effects.length > 0
+    check('59-㉓ ★★ 延迟注册时把清定时器的回调登记进 ctx.effect', timerRegistered, String(ctx.effects.length))
+    check('59-㉔ ★★ 挂了 tools/change 监听', (ctx.listeners.get('tools/change') || []).length === 1,
+      JSON.stringify([...ctx.listeners.keys()]))
+    // 触发监听 → 走一轮（仍未就绪，不消耗 attempts）
+    ;(ctx.listeners.get('tools/change') || [])[0]()
+    check('59-㉕ ★★ tools/change 触发后仍不消耗 attempts', r.state().attempts === 0, JSON.stringify(r.state()))
+    // 显式 stop 后定时器不再 tick
+    r.stop()
+    check('59-㉖ ★ stop() 后 state 仍可读（不抛）', typeof r.state().status === 'string')
+  }
+
+  // ── 定义生成失败 ─────────────────────────────────────────
+  {
+    const tools = makeFakeTools()
+    const ctx = makeFakeCtx({ value: tools })
+    const logs = []
+    const r = tr.createToolRegistrar({
+      ctx, log: (m) => logs.push(m),
+      makeDefinitions: () => { throw new Error('defs broken') },
+    })
+    r.tick()
+    const st = r.state()
+    check('59-㉗ ★ 定义生成抛错时不假装完成', st.completed === false, JSON.stringify(st))
+    check('59-㉘ ★ 定义生成失败写了日志', logs.some((l) => /工具定义生成失败/.test(l)), logs.join('|'))
+  }
 }
 
 // ─────────────────── 57 可逆摘要（archive.js + mind_expand） ───────────────────
@@ -3248,11 +3383,11 @@ group('65 ★ 存档搜索：压缩后想不起 seq 时的唯一入口')
   check('★★ 不再注册 mind_recall', !/name:\s*'mind_recall'/.test(toolsSrc66))
   check('★★ 不再注册 mind_forget', !/name:\s*'mind_forget'/.test(toolsSrc66))
 
-  // 工具总数：拆分后 6 个
+  // 工具总数：拆分后 6 个 + 2026-11-16 加的 mind_lifeline = 7 个
   // （原 11 个：减掉搬到 dsh-strand 的 4 个跨会话工具，再减掉早先并入 mind_view 的 mind_windows）
   const registered66 = (toolsSrc66.match(/name:\s*'mind_/g) || []).length
-  check('★★ 工具数 = 6', registered66 === 6, `实际 ${registered66}`)
-  check('★ 剩下的都是自我觉知或压缩类', ['mind_intend', 'mind_view', 'mind_status', 'mind_expand', 'mind_search', 'mind_compress'].every((n) => toolsSrc66.includes(`'${n}'`)))
+  check('★★ 工具数 = 7', registered66 === 7, `实际 ${registered66}`)
+  check('★ 剩下的都是自我觉知 / 压缩 / 时间索引类', ['mind_intend', 'mind_view', 'mind_status', 'mind_expand', 'mind_search', 'mind_compress', 'mind_lifeline'].every((n) => toolsSrc66.includes(`'${n}'`)))
 }
 
 
@@ -4170,6 +4305,468 @@ group('73 ★ 日记含未结追求')
     }
     check(`75-③ 若 ${f} 回来，必须有调用方`, refs > 0, `当前 ${refs} 处引用`)
   }
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  第 90 组：月度生命索引 lifeline（2026-11-16，借鉴 VCP 白皮书 §9.5）
+// ═══════════════════════════════════════════════════════════
+//
+// ⚠️ 这组要防的是「看着像做了，实际是死数据」：
+//   索引建好了但没人读、渲染了但超预算、展开了但不准 —— 三者都是静默失败。
+//   所以每条都验**行为**（返回了什么），不只验"文件存在"。
+{
+  group('第 90 组：月度生命索引')
+  const life = await import(`file:///${join(ROOT, 'lib', 'lifeline.js').split('\\').join('/')}?t=${Date.now()}`)
+
+  // ① 路径与 diary.js 必须同源（两处各拼一套路径就是历史事故的翻版）
+  const diaryMod = await import(`file:///${join(ROOT, 'lib', 'diary.js').split('\\').join('/')}?t=${Date.now()}`)
+  check('★ 90-① lifeline 的日记目录 = diary.js 的 DIARY_DIR（同源）', life.DIARY_DIR() === diaryMod.DIARY_DIR(), life.DIARY_DIR())
+
+  // ② 造两个月、三天日记，rebuild 后应有 2 个月
+  const dd = life.DIARY_DIR()
+  mkdirSync(dd, { recursive: true })
+  const mk = (name, body) => writeFileSync(join(dd, name), body, 'utf8')
+  mk('s-life-2026-10-03T10-00-00.md', '# 压缩前日记 · 2026-10-03\n\n## 已作废的结论\n- 旧方案 A 被取代\n\n今天在改 D:\\workspace\\dsh-mind\\lib\\index.js 的注入逻辑。\n主人说「先别动那段」。\n')
+  mk('s-life-2026-10-05T10-00-00.md', '# 压缩前日记 · 2026-10-05\n\n继续改 D:\\workspace\\dsh-mind\\lib\\index.js。注入逻辑已通。\n主人说「好，继续」。\n')
+  mk('s-life-2026-11-02T10-00-00.md', '# 压缩前日记 · 2026-11-02\n\n今天在查存档目录 C:\\Users\\alice\\.dsh\\mind\\archives。\n')
+
+  const rb = life.rebuild()
+  check('★ 90-② rebuild 成功', rb.ok === true, JSON.stringify(rb))
+  check('★★ 90-② 归纳出 2 个月份', rb.months === 2, `实际 ${rb.months}`)
+
+  const idx = life.readIndex()
+  check('★ 90-② 索引里有 2026-10', idx.months.some((m) => m.ym === '2026-10'))
+  check('★ 90-② 索引里有 2026-11', idx.months.some((m) => m.ym === '2026-11'))
+  const oct = idx.months.find((m) => m.ym === '2026-10')
+  check('★★ 90-② 10 月按天去重算天数（2 天）', oct.days === 2, `实际 ${oct.days}`)
+  check('★ 90-② headline 含月份与天数口径', /2026-10/.test(oct.headline) && /2\s*天/.test(oct.headline), oct.headline)
+  check('★ 90-② 路径信号被抓到（最有用的锚点）', oct.paths.some((p) => /dsh-mind/.test(p)), JSON.stringify(oct.paths))
+
+  // ③ 幂等：同样的日记再 rebuild 一次，headline 不变（否则指纹每步都抖）
+  const octBefore = life.readIndex().months.find((m) => m.ym === '2026-10').headline
+  const rb2 = life.rebuild()
+  const octAfter = life.readIndex().months.find((m) => m.ym === '2026-10').headline
+  check('★★ 90-③ rebuild 幂等（headline 不变）', octBefore === octAfter, `${octBefore} → ${octAfter}`)
+  check('★ 90-③ 第二次 rebuild 不报「新增」', rb2.added === 0, `实际 ${rb2.added}`)
+
+  // ④ 渲染：有内容、在预算内、含展开指引
+  const rendered = life.renderIndex(1300)
+  check('★ 90-④ 渲染非空', rendered.length > 0)
+  check('★★ 90-④ 渲染在预算内', rendered.length <= 1300, `实际 ${rendered.length}`)
+  check('★ 90-④ 渲染含月份行', rendered.includes('2026-10'))
+  check('★★ 90-④ 渲染含展开指引（否则那一层是只写不读）', rendered.includes('mind_lifeline'))
+
+  // ⑤ 预算很小时：从**最近**往前保留（近的更可能相关）
+  const tiny = life.renderIndex(120)
+  check('★ 90-⑤ 极小预算也不炸', typeof tiny === 'string')
+  if (tiny) {
+    check('★★ 90-⑤ 极小预算保留最近的月份（11 月优先）', tiny.includes('2026-11') || !tiny.includes('2026-10'), tiny.slice(0, 120))
+  }
+
+  // ⑥ 语境命中：提到 dsh-mind 路径应命中 10 月
+  const rel = life.pickRelevant('刚才说的 dsh-mind/lib/index.js 那个改动')
+  check('★ 90-⑥ 语境命中返回结果', Array.isArray(rel))
+  check('★★ 90-⑥ 命中 2026-10（那个月里有这条路径）', rel.some((r) => r.ym === '2026-10'), JSON.stringify(rel))
+  check('★ 90-⑥ 反向：无关语境不命中', life.pickRelevant('今天天气不错').length === 0)
+
+  // ⑦ 展开：有该月 → 给细节；无该月 → 明确报错并列出可用月份
+  const ex = life.expandMonth('2026-10')
+  check('★ 90-⑦ 展开 2026-10 成功', ex.ok === true)
+  check('★ 90-⑦ 展开带路径细节', Array.isArray(ex.paths) && ex.paths.length > 0)
+  const exBad = life.expandMonth('1999-01')
+  check('★★ 90-⑦ 展开不存在的月份：明确失败且列出可用', exBad.ok === false && /2026-10/.test(exBad.error), exBad.error)
+
+  // ⑧ 反向：日记目录不存在时不抛、不编造
+  const stashed = dd + '.stash'
+  let noDiary = null
+  try {
+    rmSync(stashed, { recursive: true, force: true })
+    // 用 rename 暂时挪走目录
+    const { renameSync } = await import('node:fs')
+    renameSync(dd, stashed)
+    noDiary = life.rebuild()
+  } finally {
+    try {
+      const { renameSync } = await import('node:fs')
+      if (existsSync(stashed) && !existsSync(dd)) renameSync(stashed, dd)
+    } catch {
+      /* 恢复失败不掩盖上面的结论 */
+    }
+  }
+  check('★★ 90-⑧ 没有日记目录时不抛异常', noDiary && noDiary.ok === true, JSON.stringify(noDiary))
+
+  // ⑨ ★★★ 主题词必须在**跨篇**尺度上判断（2026-11-16 真机血证，连修五轮）
+  //
+  // ⚠️ 这条是本组最重要的一条，它防的是一个**完全静默**的错，而且这个错
+  //   在真机上连演了五轮才收敛，每一轮的错法都不同：
+  //
+  //   轮1 单篇统计：门槛按单篇算 → 单篇仅 1600 字符，同词不可能出现 3 次
+  //       → 主题词恒空，月索引只剩「节：…」，**没有任何报错**。
+  //   轮2 整月拼接：次数够了，但贪婪匹配切出「磁盘阵列的事」这种跨词碎片。
+  //   轮3 只拦收尾：切出「今天继续处理」「进度还行」。
+  //   轮4 含虚词就丢：又全空。
+  //   轮5 按篇计数 + 只取本窗口段落 + **优先用 mind_intend 的追求句**
+  //       → 终于稳定（本机真机实测：得出「重建 bili 运行环境」）。
+  //
+  //   最终判据（也就是这条测试要盯的）：
+  //     · 有追求声明 → 用它，且 themeSource='pursuit'
+  //     · 没追求声明 → 用跨篇词频，且 themeSource='word'
+  //     · 两者都没有 → themeSource='none'（**明确标注，不假装有主题**）
+  //   三种来源必须可区分，否则下游会把机器猜的词当成人写的主题。
+  const dd2 = life.DIARY_DIR()
+  const topicWord = '磁盘阵列'
+
+  // 造 4 篇同月日记，每篇都带一段**追求声明**（模拟 mind_intend 登记过的）
+  for (let i = 0; i < 4; i++) {
+    const d = String(10 + i).padStart(2, '0')
+    writeFileSync(
+      join(dd2, `s-agg-2026-09-${d}T10-00-00.md`),
+      `# 压缩前日记 · 2026-09-${d} 10:00:00 UTC\n\n` +
+        `## 我在追什么（mind_intend 的未结声明）\n- [abc123] 主线：搭建${topicWord}的备份流程（E:\\temp\\x）。后面还有细节\n\n` +
+        `## 别的窗口在忙什么（不是本窗口的事）\n- [ffff] 12:00 [助手] 完全无关的另一件事\n`,
+      'utf8',
+    )
+  }
+  life.rebuild()
+  const sep = life.readIndex().months.find((m) => m.ym === '2026-09')
+  check('★★ 90-⑨ 有追求声明时 themeSource=pursuit', sep?.themeSource === 'pursuit', sep?.themeSource)
+  check('★★★ 90-⑨ 月主题取自追求句（含"磁盘阵列"）', !!sep && (sep.points ?? []).some((p) => p.includes(topicWord)), JSON.stringify(sep?.points))
+  check('★★ 90-⑨ 主题句被压缩成短句（≤32 字符，去掉"主线："前缀）', (sep?.points ?? []).every((p) => p.length <= 32 && !p.startsWith('主线')), JSON.stringify(sep?.points))
+  check('★★★ 90-⑨ 别的窗口的段没有被当成本月主题', !(sep?.points ?? []).some((p) => p.includes('无关的另一件事')), JSON.stringify(sep?.points))
+  check('★★ 90-⑨ headline 用「在做：」而不是「主题：」标出人写的来源', !!sep && sep.headline.includes('在做：'), sep?.headline)
+
+  // ⑩ 反向：没有追求声明时退回词频，且来源标成 word（不冒充人写的）
+  for (let i = 0; i < 2; i++) {
+    const d = String(20 + i).padStart(2, '0')
+    writeFileSync(
+      join(dd2, `s-word-2026-08-${d}T10-00-00.md`),
+      `# 压缩前日记 · 2026-08-${d}\n\n今天继续处理${topicWord}的扩容。\n`,
+      'utf8',
+    )
+  }
+  life.rebuild()
+  const aug = life.readIndex().months.find((m) => m.ym === '2026-08')
+  check('★★ 90-⑩ 无追求声明时退回词频（themeSource=word）', aug?.themeSource === 'word', aug?.themeSource)
+  check('★ 90-⑩ headline 用「线索词：」标明是机器候选', !!aug && aug.headline.includes('线索词：'), aug?.headline)
+
+  // ⑪ 反向：一篇都没有 → themeSource=none，不能编一个主题出来
+  writeFileSync(join(dd2, 's-none-2026-07-01T10-00-00.md'), '# 压缩前日记 · 2026-07-01\n\n嗯\n', 'utf8')
+  life.rebuild()
+  const jul = life.readIndex().months.find((m) => m.ym === '2026-07')
+  check('★★★ 90-⑪ 没有可用信号时 themeSource=none（不编主题）', jul?.themeSource === 'none', JSON.stringify({ src: jul?.themeSource, pts: jul?.points }))
+
+  // ⑫ ★★★ rebuildEveryMs 必须真的被消费（2026-11-16 体检 A1）
+  //
+  // ⚠️ 血证：这个键从上线起就是死配置 —— 注释承诺定时重建，
+  //   实现只有「索引为空才建」，索引建一次后永不更新，新日记静默进不了索引。
+  //   判据分两半：rebuildDue 的龄期判断 + index.js 真的调了它（防再退回死配置）。
+  life.rebuild() // 确保 builtAt 是刚才
+  const SIX_H = 6 * 60 * 60 * 1000
+  const fresh = life.rebuildDue(SIX_H)
+  check('★★★ 90-⑫ 刚建好的索引不到期（不每步重扫）', fresh.due === false, JSON.stringify(fresh))
+  const aged = life.rebuildDue(SIX_H, Date.now() + SIX_H + 1)
+  check('★★★ 90-⑫ 超过 rebuildEveryMs 后到期（新日记能进索引）', aged.due === true && aged.reason === 'aged', JSON.stringify(aged))
+  check('★★ 90-⑫ 间隔非法时保守判到期（宁可多扫不可陈旧）', life.rebuildDue(0).due === true && life.rebuildDue('abc').due === true)
+  const idxSrc = readFileSync(join(ROOT, 'lib', 'index.js'), 'utf8')
+  check('★★★ 90-⑫ index.js 真的消费 rebuildEveryMs（不是只在注释里）',
+    /rebuildDue\(config\.lifeline\?\.rebuildEveryMs/.test(idxSrc))
+  check('★★ 90-⑫ 展开指引的参数名与工具一致（ym，不是 expand）',
+    life.renderIndex(1300).includes('{ym:"YYYY-MM"}'), life.renderIndex(1300).slice(-80))
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  第 91 组：工具结果账本 tool-ledger（2026-11-16，借鉴 VCP 白皮书 §4.7）
+// ═══════════════════════════════════════════════════════════
+//
+// ⚠️ 这组要防的是「把不确定说成成功」：
+//   outcomeOf 只允许在**明确**看到 ok/error 时给结论，其余一律 unknown。
+//   反过来（把 ok:true 判成 unknown）只是保守，不算错；但把 unknown 判成 ok 是造假。
+{
+  group('第 91 组：工具结果账本')
+  const tl = await import(`file:///${join(ROOT, 'lib', 'tool-ledger.js').split('\\').join('/')}?t=${Date.now()}`)
+
+  check('★ 91-① ok:true → ok', tl.outcomeOf({ ok: true }) === 'ok')
+  check('★ 91-① ok:false → failed', tl.outcomeOf({ ok: false }) === 'failed')
+  check('★★ 91-① 只有 error 字段也判 failed', tl.outcomeOf({ error: 'boom' }) === 'failed')
+  check('★★ 91-① 无法判断时是 unknown，**不许**判成 ok', tl.outcomeOf({ data: 1 }) === 'unknown')
+  check('★★ 91-① null 结果不得判成 ok', tl.outcomeOf(null) === 'unknown')
+  check('★ 91-① 文本里的「失败」能识别', tl.outcomeOf('命令失败：exit 1') === 'failed')
+
+  // ①b ★★★ 宿主原生形状 isError（2026-11-16 重启后真机发现的第一处漏判）
+  //
+  // ⚠️ 这条必须留着，否则会复发成"账本里全是 · 而没有 ✅"：
+  //   宿主 `tools/post-execute` 传下来的 result 用的是 **isError: boolean**
+  //   （取证：asar dsh-tools/lib/pipeline.js:732 → isError:false；:743 → isError:true），
+  //   而本函数原来只认 ok / error，于是**每一条真实工具结果都被判成 unknown**。
+  //   真机表现：`· pwsh (3406字)`，看着像"工具都没成"。
+  check('★★★ 91-①b 宿主 isError:false → ok', tl.outcomeOf({ isError: false, content: [{ type: 'text', text: 'hi' }] }) === 'ok')
+  check('★★★ 91-①b 宿主 isError:true → failed', tl.outcomeOf({ isError: true, error: { message: 'boom' } }) === 'failed')
+  check('★★ 91-①b isError 优先于 content 里的文字猜测', tl.outcomeOf({ isError: false, content: [{ type: 'text', text: '这里有个 error 字样' }] }) === 'ok')
+
+  // ①c ★★★ 并发同名工具靠 callId 配对（2026-11-16 重启后真机发现的第二处）
+  //
+  // ⚠️ 真机症状：同一步里两个 pwsh 一起跑，账本出现「unknown pwsh」「pending pwsh」各一条。
+  //   根因是只按工具名从后往前找 → A 的结果可能补到 B 上，且**不报错**。
+  //   模型一步并发调两个同名工具是常态（本项目自己就常并发 pwsh），所以这条必须钉住。
+  const cidTest = 'call-AAA'
+  tl.record({ sessionId: 's-conc', tool: 'pwsh', result: null, pending: true, callId: cidTest })
+  tl.record({ sessionId: 's-conc', tool: 'pwsh', result: null, pending: true, callId: 'call-BBB' })
+  tl.settle({ sessionId: 's-conc', tool: 'pwsh', result: { isError: false }, callId: cidTest })
+  const conc = tl.list('s-conc')
+  check('★★★ 91-①c 两个同名 pending 各自独立', conc.length === 2, `实际 ${conc.length}`)
+  check('★★★ 91-①c 只补了 callId 匹配的那一条', conc[0].outcome === 'ok' && conc[1].outcome === 'pending', conc.map((e) => e.outcome).join(','))
+  check('★★ 91-①c callId 不匹配时明确失败（不退回按名配）',
+    tl.settle({ sessionId: 's-conc', tool: 'pwsh', result: { isError: false }, callId: 'call-XXX' }).missing === true)
+
+  // ② 记录 + 上限：超过 maxEntries 从最老的丢
+  const sid = 's-ledger'
+  for (let i = 0; i < 10; i++) {
+    tl.record({ sessionId: sid, tool: `t${i}`, result: { ok: true }, maxEntries: 5 })
+  }
+  const kept = tl.list(sid)
+  check('★★ 91-② 上限生效（10 条记成 5 条）', kept.length === 5, `实际 ${kept.length}`)
+  check('★ 91-② 丢的是最老的（保留 t5..t9）', kept[0].tool === 't5' && kept[4].tool === 't9', kept.map((e) => e.tool).join(','))
+
+  // ③ pending → settle：就地补全同一条，不追加第二条
+  tl.record({ sessionId: 's-settle', tool: 'grep', result: null, pending: true })
+  const beforeSettle = tl.list('s-settle').length
+  tl.settle({ sessionId: 's-settle', tool: 'grep', result: { ok: false, error: 'no match' } })
+  const afterSettle = tl.list('s-settle')
+  check('★★ 91-③ settle 不新增条目（就地补全）', afterSettle.length === beforeSettle, `${beforeSettle} → ${afterSettle.length}`)
+  check('★ 91-③ settle 后带成败', afterSettle[0].outcome === 'failed', afterSettle[0].outcome)
+  check('★ 91-③ 记了补全时间', typeof afterSettle[0].settledAt === 'number')
+
+  // ④ 反向：没有 pending 时 settle 要明确报错（不能静默吞掉）
+  const miss = tl.settle({ sessionId: 's-settle', tool: 'never-ran', result: { ok: true } })
+  check('★★ 91-④ settle 找不到 pending 时明确失败', miss.ok === false && miss.missing === true, JSON.stringify(miss))
+
+  // ⑤ 渲染：含成功/失败标记、在预算内
+  const r = tl.render('s-settle', 900)
+  check('★ 91-⑤ 渲染非空', r.length > 0)
+  check('★ 91-⑤ 渲染在预算内', r.length <= 900, `实际 ${r.length}`)
+  check('★ 91-⑤ 失败带 ❌', r.includes('❌'))
+
+  // ⑤b ★★★ unknown 不逐行列出（2026-11-16 重启后真机看到流水账后改）
+  //
+  // ⚠️ 真机第一版渲染出 26 行，其中 8 行是 `· · ·`（unknown）。
+  //   unknown 表示"不知道成没成"，**不携带任何结论**，却和 ✅/❌ 一样占一整行。
+  //   白皮书对"摘要数组"的定义是「只留时间戳和状态」，不是把流程复述一遍。
+  //   现在 unknown 只计数不分行，但**条数必须留**（大量 unknown 说明判定有问题，
+  //   那是要能看出来的信号，不能悄悄丢掉）。
+  tl.record({ sessionId: 's-render', tool: 'bash', result: { isError: false } })
+  tl.record({ sessionId: 's-render', tool: 'bash', result: null }) // unknown
+  tl.record({ sessionId: 's-render', tool: 'bash', result: null }) // unknown
+  tl.record({ sessionId: 's-render', tool: 'bash', result: { isError: true } })
+  const rr = tl.render('s-render', 900)
+  check('★★★ 91-⑤b unknown 不占整行', !/^- \d{2}:\d{2} · /m.test(rr), rr)
+  check('★★★ 91-⑤b 但 unknown 的条数被保留（折成一行）', /另有 2 次调用未能判定成败/.test(rr), rr)
+  check('★★ 91-⑤b 成功与失败仍然分行显示', /✅ bash/.test(rr) && /❌ bash/.test(rr), rr)
+
+  // ⑤c 反向：**全部**是 unknown 时不能返回空段（否则那一段变成只有标题）
+  tl.record({ sessionId: 's-allunknown', tool: 'bash', result: null })
+  const ru = tl.render('s-allunknown', 900)
+  check('★★★ 91-⑤c 全是 unknown 时仍给出条数，不返回空串', ru.length > 0 && /均未能判定成败/.test(ru), ru)
+
+  // ⑥ 会话隔离：A 的账本不出现在 B
+  check('★★ 91-⑥ 会话之间互不串', tl.list('s-ledger').length > 0 && tl.list('s-never').length === 0)
+
+  // ⑦ 反向：空会话渲染返回空串（不能返回一个只有标题的空段占预算）
+  check('★★ 91-⑦ 空账本渲染为空串', tl.render('s-never', 900) === '')
+
+  // ⑧ stats 的数字必须与真实账本一致（不编数）
+  const st = tl.stats()
+  let realEntries = 0
+  for (const k of ['s-ledger', 's-settle']) realEntries += tl.list(k).length
+  check('★★ 91-⑧ stats.entries 与实际条目数一致', st.entries >= realEntries, `stats=${st.entries} 实际≥${realEntries}`)
+
+  // ⑨ ★★★ 一句话摘要必须真的被生成（2026-11-16 体检 A2）
+  //
+  // ⚠️ 血证：设计承诺「工具名+成败+大小+一句话」，但 pre 不传 summary、
+  //   settle 不补 —— 真机 35 条 summary 全空，且没有任何测试盯着它。
+  //   这组判据钉住：入参提取正确、record 落盘、settle 不弄丢、渲染带出来。
+  check('★★★ 91-⑨ description 优先（pwsh 的人话说明）',
+    tl.summarizeArgs('pwsh', { description: '列出目录', command: 'ls' }) === '列出目录')
+  check('★★ 91-⑨ 文件类取路径尾段并带动词',
+    tl.summarizeArgs('edit', { file_path: 'E:\\a\\b\\foo.js' }).includes('foo.js'))
+  check('★★ 91-⑨ 检索类取 pattern',
+    tl.summarizeArgs('grep', { pattern: 'rebuildDue' }).includes('rebuildDue'))
+  check('★★ 91-⑨ 提取不到时返回空串（不编）',
+    tl.summarizeArgs('unknown-tool', { foo: 1 }) === '')
+  check('★ 91-⑨ 坏入参不抛', tl.summarizeArgs('pwsh', null) === '')
+  check('★★ 91-⑨ 摘要被截到上限内',
+    tl.summarizeArgs('pwsh', { description: 'x'.repeat(500) }, 160).length <= 160)
+
+  tl.record({ sessionId: 's-sum', tool: 'pwsh', result: null, pending: true, callId: 'c-sum',
+    summary: tl.summarizeArgs('pwsh', { description: '跑回归测试' }) })
+  tl.settle({ sessionId: 's-sum', tool: 'pwsh', result: { isError: false }, callId: 'c-sum' })
+  const sumEntry = tl.list('s-sum')[0]
+  check('★★★ 91-⑨ settle 后摘要仍在（不被补全冲掉）', sumEntry.summary === '跑回归测试', JSON.stringify(sumEntry))
+  const sumRender = tl.render('s-sum', 900)
+  check('★★★ 91-⑨ 渲染把摘要带出来（压缩后能看到"查的是什么"）', sumRender.includes('跑回归测试'), sumRender)
+  check('★★ 91-⑨ 省略脚注不再指向 mind_search（账本不在存档里，那是走不通的路）',
+    !tl.render('s-ledger', 120).includes('mind_search'), tl.render('s-ledger', 120))
+
+  // ⑩ ★★★ 死会话的账本格必须能被清掉（2026-11-16 体检 A5）
+  //
+  // ⚠️ 血证：clearSession 写好后全库零调用，账本按会话累格只进不出
+  //   （真机半天 2 格→6 格）。现在双保险：disposed 即清 + 启动按龄期兜底。
+  //   判据：clearSession 真删、sweepSessions 只清死的不动活的、index.js 真接线。
+  tl.record({ sessionId: 's-die', tool: 'pwsh', result: { ok: true } })
+  const dieR = tl.clearSession('s-die')
+  check('★★ 91-⑩ clearSession 真删格', dieR.ok === true && dieR.removed === 1 && tl.list('s-die').length === 0, JSON.stringify(dieR))
+  check('★ 91-⑩ 清不存在的格不报错', tl.clearSession('s-ghost').ok === true)
+
+  // 造一个「8 天前有动静」的死格和一个「刚刚有动静」的活格
+  const OLD = Date.now() - 8 * 24 * 60 * 60 * 1000
+  tl.record({ sessionId: 's-old', tool: 'pwsh', result: { ok: true }, now: OLD })
+  tl.record({ sessionId: 's-live', tool: 'pwsh', result: { ok: true } })
+  const sweepR = tl.sweepSessions()
+  check('★★★ 91-⑩ sweep 清掉 7 天无动静的死格', sweepR.removed >= 1 && tl.list('s-old').length === 0, JSON.stringify(sweepR))
+  check('★★★ 91-⑩ sweep 绝不动活会话（哪怕格数多）', tl.list('s-live').length === 1)
+  const idxSrcA5 = readFileSync(join(ROOT, 'lib', 'index.js'), 'utf8')
+  // ⚠️ 2026-11-16 晚设计修正：第一版判据要求 disposed 里调 clearSession ——
+  //   重启验收发现本宿主同一 session 的 agent 每次重启都 disposed 再 created，
+  //   照那版每次重启会抹掉当前会话的账本（毁掉跨重启存活这个立身之本）。
+  //   现在判据反过来：disposed **不许**清账本，清理只走启动 sweep。
+  check('★★★ 91-⑩ disposed 处理器不清账本（重启≠会话死亡，历史必须活过重启）',
+    !/agent\/disposed[\s\S]{0,900}ToolLedger\.clearSession\(/.test(idxSrcA5))
+  /**
+   * ⚠️ 2026-11-17 改判据：原来只匹配 `sweepSessions()` 的空参调用，
+   * 而那个调用方式**正是缺陷本身** —— 不传活跃集合，就会把"最近没调工具"
+   * 的活会话当成死会话清掉（隔离已复现）。
+   * 现在要求：调用点必须传 liveSessions，且必须从 agents.list 取。
+   */
+  check('★★ 91-⑩ 启动路径真的调 sweepSessions 且**传入活跃会话集合**',
+    /ToolLedger\.sweepSessions\([\s\S]{0,160}liveSessions/.test(idxSrcA5))
+  check('★★★ 91-⑩ 活跃集合来自宿主的 agents.list（不是凭空判断）',
+    /agents\?\.list|agents\.list/.test(idxSrcA5))
+  // 行为级：把活格传给 sweep，它必须豁免（哪怕条目是 8 天前的）
+  const oldAgain = Date.now() - 8 * 24 * 60 * 60 * 1000
+  tl.record({ sessionId: 's-live-old', tool: 'pwsh', result: { ok: true }, now: oldAgain })
+  const exemptR = tl.sweepSessions(undefined, Date.now(), { liveSessions: ['s-live-old'] })
+  check('★★★ 91-⑩ 活会话虽 8 天无工具记录，也不被清（2026-11-17 修）',
+    tl.list('s-live-old').length === 1 && exemptR.exempt >= 1, JSON.stringify(exemptR))
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  第 92 组：摘要纪律的四个禁止项（2026-11-16，借鉴 VCP 白皮书 §9.4）
+// ═══════════════════════════════════════════════════════════
+//
+// ⚠️ 为什么这类"文字条款"也要测：
+//   它们只在压缩后生效，而压缩后**没人看得到原文**了。
+//   条款被删掉（或改写走味）时不会有任何报错，只会让未来的自己多几条假记忆。
+//   唯一能自动发现的办法是盯住这几个**不可替代的判据**。
+{
+  group('第 92 组：摘要纪律禁止项')
+  const compSrc = readFileSync(join(ROOT, 'lib', 'compaction.js'), 'utf8')
+  const diarySrc = readFileSync(join(ROOT, 'lib', 'diary.js'), 'utf8')
+
+  // ①②③④ 四条禁止项在压缩指令里各自可定位
+  check('★★ 92-① 禁止把推测/争议升级为事实', /不升级为事实|推测与争议/.test(compSrc))
+  check('★★ 92-② 禁止作人格与价值判断', /价值判断与人格结论/.test(compSrc))
+  check('★★ 92-③ 禁止代未来的自己许诺', /不代未来的自己许诺/.test(compSrc))
+  check('★★ 92-④ 禁止编无输入的待办', /不编未获输入支持的待办/.test(compSrc))
+
+  // 每条都带反例：只写要求不写反例，规则会被过度泛化（本机 AGENTS.md 明确要求）
+  check('★★ 92-① 带反例（❌→✅ 对照）', /反例：❌/.test(compSrc))
+
+  // 日记侧也要有同频约束（日记比摘要"看着更可信"，不约束等于没约束）
+  check('★★ 92-日记 约束「只记录不解读」', /只记录、不解读/.test(diarySrc))
+  check('★★ 92-日记 约束「不许诺、不编待办」', /不许诺、不编待办/.test(diarySrc))
+
+  // 反向：这四条必须落在**指令正文**里，不能只是注释说明
+  //
+  // ⚠️ 切片方式改过一次（2026-11-16 本组首次跑就红）：
+  //   第一版取 `indexOf('规则：')` 当结尾锚点，而「规则：」在四条禁止项**之前**，
+  //   于是切出来的区间根本不含它们 —— 判据写错，功能是对的。
+  //   现在改成按**模板字符串的边界**切：从常量声明到收尾反引号，
+  //   这个边界是确定性的，不依赖正文里出现什么字。
+  //
+  //   ⚠️ 第二次修：第一版用 `` `\n `` 当结尾，而本仓库文件是 CRLF（`` `\r\n ``），
+  //   于是 indexOf 返回 -1、区间长度 0 —— 又是一个"判据写错、功能是对的"。
+  //   现在只找反引号本身（第二个），不假设行尾是 LF 还是 CRLF。
+  const BT = '`'
+  const instrStart = compSrc.indexOf('const MIND_COMPACTION_INSTRUCTION')
+  const firstBt = instrStart >= 0 ? compSrc.indexOf(BT, instrStart) : -1
+  const closingBt = firstBt >= 0 ? compSrc.indexOf(BT, firstBt + 1) : -1
+  const instrBlock = instrStart >= 0 && closingBt > firstBt ? compSrc.slice(firstBt, closingBt) : ''
+  check(
+    '★★ 92-反向 四条禁止项在指令常量内（不是只在注释里）',
+    instrBlock.includes('不升级为事实') &&
+      instrBlock.includes('价值判断与人格结论') &&
+      instrBlock.includes('不代未来的自己许诺') &&
+      instrBlock.includes('不编未获输入支持的待办'),
+    `区间 ${instrBlock.length} 字符`,
+  )
+  // 另一条反向：常量里不许出现"可以省略某一节"之类的放松措辞
+  check('★★ 92-反向 指令没被改成可删节', !/这一节可以省略|可以删掉整节/.test(compSrc))
+}
+
+
+// ═══════════════════════════════════════════════════════════
+//  第 93 组：陈旧追求标龄 + injected 日志含 ledger（2026-11-16 体检 A6/A7）
+// ═══════════════════════════════════════════════════════════
+//
+// ⚠️ A6 血证：3 条未结追求停在 9~12 天前且互相矛盾（同一件事的
+//   「已完成/进行中/刚开工」三个阶段快照），被原样注入给每个窗口。
+//   「12 天前」是中性时间标注，模型会滑过去把旧进展当现状。
+//   修法：≥3 天未更新的追求句必须带「可能已完成或已放弃」警示。
+//   ⚠️ 只标注不自动关：陈旧≠完成，自动 close 会误杀长任务。
+//
+// ⚠️ A7 血证：injected 日志的段明细 [life= psy= dia= tac=] 漏了 ledger ——
+//   账本注入没注入、占多少字，日志里看不出来，排查时第一证据是瞎的。
+{
+  group('第 93 组：追求标龄与日志完整性')
+  resetData()
+  const io93 = await import(`file:///${join(ROOT, 'lib', 'io.js').split('\\').join('/')}?t=${Date.now()}`)
+  const psy93 = await import(`file:///${join(ROOT, 'lib', 'segments', 'psyche.js').split('\\').join('/')}?t=${Date.now()}`)
+  const state93 = await import(`file:///${join(ROOT, 'lib', 'state.js').split('\\').join('/')}?t=${Date.now()}`)
+  const diary93 = await import(`file:///${join(ROOT, 'lib', 'diary.js').split('\\').join('/')}?t=${Date.now()}`)
+  const NOW = Date.now()
+  const DAY = 24 * 60 * 60 * 1000
+
+  // ① 纯函数：门槛两侧 + 坏输入
+  check('★★ 93-① 2 天前的追求不标（还在正常推进期）', io93.pursuitStaleNote(NOW - 2 * DAY, NOW) === '')
+  check('★★★ 93-① 4 天前的追求带警示与天数', /4 天未更新/.test(io93.pursuitStaleNote(NOW - 4 * DAY, NOW)), io93.pursuitStaleNote(NOW - 4 * DAY, NOW))
+  check('★★ 93-① 警示里指了关闭的路（mind_intend {close}）', io93.pursuitStaleNote(NOW - 4 * DAY, NOW).includes('mind_intend'))
+  check('★ 93-① 坏时间不抛也不编', io93.pursuitStaleNote(null, NOW) === '' && io93.pursuitStaleNote('abc', NOW) === '')
+
+  // ② 注入渲染：陈旧追求带警示，新鲜追求不带
+  const st93 = new state93.Store()
+  st93.addPursuit('主线：陈旧的事，早就翻篇了', null, NOW - 12 * DAY)
+  st93.addPursuit('副线：新鲜的事，正在推进', null, NOW - 60 * 1000)
+  const rendered93 = psy93.renderPursuits(st93, NOW)
+  check('★★★ 93-② 注入里陈旧追求带「12 天未更新」警示', /陈旧的事[\s\S]{0,200}12 天未更新/.test(rendered93), rendered93)
+  check('★★★ 93-② 新鲜追求不带警示（不误报）', /新鲜的事[^\n]*\n?/.test(rendered93) && !/新鲜的事[^\n]*未更新/.test(rendered93), rendered93)
+  check('★★ 93-② 反向：陈旧≠自动关闭（长任务不被误杀）', st93.openPursuits().length === 2)
+
+  // ③ 日记：压缩后的自己读到的追求也必须带警示（原文已遮蔽，这里危害最大）
+  const sid93 = 's-d93-stale'
+  const p93 = diary93.maybeWriteDiary({ tokenMeter: { measure: () => ({ totalTokens: 500000 }) } }, {
+    sessionId: sid93,
+    agent: { id: sid93, session: { id: sid93 } },
+    facts: [], timeline: [],
+    pursuits: [{ id: 'p93', text: '主线：十二天前的旧进展', at: NOW - 12 * DAY }],
+    config: { diary: { enabled: true, pressureRatio: 0.7, contextWindow: 600000 } },
+    now: NOW,
+  })
+  check('★ 93-③ 前置：日记写出来了', typeof p93 === 'string' && existsSync(p93), String(p93))
+  if (typeof p93 === 'string' && existsSync(p93)) {
+    const body93 = readFileSync(p93, 'utf8')
+    check('★★★ 93-③ 日记里的陈旧追求带警示', /十二天前的旧进展[^\n]*12 天未更新/.test(body93), body93.slice(body93.indexOf('我在追什么'), body93.indexOf('我在追什么') + 300))
+  }
+
+  // ④ mind_view 带 stale 字段（工具与注入同口径）
+  const toolsSrc93 = readFileSync(join(ROOT, 'lib', 'tools.js'), 'utf8')
+  check('★★ 93-④ mind_view 的 pursuits 带 stale 字段', /stale: pursuitStaleNote\(p\.at, now\)/.test(toolsSrc93))
+
+  // ⑤ A7：injected 日志五段齐全（ledger 不再隐身）
+  const idxSrc93 = readFileSync(join(ROOT, 'lib', 'index.js'), 'utf8')
+  check('★★★ 93-⑤ injected 日志含 led= 字段（账本注入量可见）',
+    /dia=\$\{segments\.diary\.length\} led=\$\{segments\.ledger\.length\} tac=/.test(idxSrc93))
 }
 
 

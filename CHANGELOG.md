@@ -4,6 +4,150 @@
 
 ---
 
+## v1.1.0 — 2026-11-22（性能、检索、经验库与双核软联动全面升级）
+
+- **工具账本异步化与内存缓存**（`lib/tool-ledger.js`、`lib/io.js`、`lib/index.js`）：新增 `mtimeMs:size` 内存缓存、`deferMs: 1200` 异步防抖批写（`ctx.effect` 退出兜底 `flush()`）、紧凑 JSON 落盘（体积直降 ~40%）、`statSync().size` 轻量化统计与大输出标记；Windows 原子重命名支持 `EPERM/EBUSY/EACCES` 退避重试，读取自动剥离 UTF-8 BOM。
+- **生命线去污与增量去重**（`lib/lifeline.js`、`lib/index.js`）：原话引语仅从正文抽取并过滤模板占位引语与 `AGENTS.md` 路径；双循环合并为单趟扫描；新增索引文件签名缓存；`pickRelevant()` 同时覆盖 `quotes`；`pre-step` 增量注入新增生命线去重与相关月份精准提示。
+- **存档检索与还原升级**（`lib/archive.js`、`lib/infer-region.js`）：`listArchives()` 改为按 `(sessionKey, startSeq, endSeq)` 数值排序；`expandRegion()` 按文件名范围提前剪枝；`searchArchives()` 升级确定性相关性打分；`infer-region.js` 纳入工具调用/结果签名并修复空串误匹配。
+- **日记、经验库与主动推送可靠性**（`lib/diary.js`、`lib/segments/tacit.js`、`lib/state.js`、`lib/index.js`）：日记改为懒加载 `getPeer` + 无时间线时的会话尾段回退 + 原子写入再轮转；经验库新增文件签名缓存、frontmatter `keywords` 解析、`task.after-change` 动作推导及标题字符预算计入；主动通知 `notice` 在精确节流后消费且豁免节流；追踪 `mind_intend` 原地更新指纹。
+- **与 `dsh-neural-memory` 零耦合软联动**（`lib/compaction.js`、`lib/tools.js`）：若宿主同时加载 `neural-memory`，压缩总结与核心意图声明会异步静默同步至 `namespace: "mind"`，无硬依赖；`summarize()` 补齐配置文件回退；回归测试 **808/808** + 新增升级测试 **18/18** 全绿。
+
+---
+
+## v1.0.x — 2026-11-20（工具注册：修两个永久放弃/永久缺失的 bug）
+
+回归 **808/808 通过**（第 59 组从 10 项重写为 28 项行为级判据，净增 15 项）。
+
+### 起因
+
+外部代码审查报告指出「工具注册遇到部分失败时提前停止重试」。
+逐条核对源码后确认属实，且**比审查描述的更严重**——审查只看到 bug ①，没看到 bug ②。
+存档清理那一条按既定设计决定保留不自动删，本节不涉及。
+
+### bug ① · 部分成功即视为全部成功 → 失败的工具永久缺失
+
+- **位置**：`lib/index.js` 旧 `tryRegisterTools()`，`if (n > 0) { registered = true }`。
+- **后果**：7 个 `mind_*` 工具里 1 个抛普通错误、其余 6 个成功 → `n=6 > 0` → 认定全部完成 →
+  定时器被清掉 → 后续 `tools/change` 也被 `registered` 挡住。
+  那个失败的工具**永久缺失**，而日志写「已注册 6 个」。
+- **修法**：判据改成 `done` 覆盖**全部定义名**（`missingNames().length === 0`）。
+  部分成功时保持 `partial` 状态，`tools/change` 与轮询继续补缺失项，且只碰缺的那些。
+
+### bug ② · 工具服务未就绪也消耗尝试次数 → 10 秒后永久放弃且零日志
+
+- **位置**：同上，`attempts++` 在 `if (!tools?.register) return` **之前**。
+- **后果**：500ms 轮询 × `MAX_ATTEMPTS=20` = **10 秒**。宿主 `tools` 服务 10 秒没就绪，
+  插件就永久放弃，**7 个工具一个都没有**，而且这条路径是静默 `return`，**一行日志都不打**。
+  后果比 bug ① 严重：不是「部分工具缺失」，是全部没有，日志干净得像正常启动。
+- **修法**：区分两种计数——`attempts`（真注册失败）与 `notReady`（服务未就绪）。
+  未就绪**不消耗**注册次数，独立上限 600 轮（≈5 分钟）。服务晚到仍能正常注册。
+
+### 附带修好的三处
+
+1. **「已注册」日志的数量是假的**：旧代码 `n` 是「成功 + 已存在」的合计，不是真实注册数。
+   现在写 `${done.size}/${total}`。
+2. **放弃时只写「注册失败」，不写缺谁**：现在明确列出未注册的名字清单。
+3. **卸载残留**：`setInterval` 绑定到 `ctx.effect` 清理。
+   ⚠️ 顺带**取证澄清**：`ctx.on` **不需要**手动清——读 `@deepseek-ai/cordis` 的
+   `EventsService.register()`（asar 内 `lib/index.js:919-929`），它内部走
+   `this.ctx.fiber.effect(...)`，fiber 卸载时自动 unregister。所以本文件那 9 处
+   `ctx.on` 不加 `ctx.effect` 是**正确**的，此前评审里怀疑的「监听器泄漏」不存在。
+
+### 结构性改动：逻辑抽成 `lib/tool-register.js`
+
+**原测试是假绿的**（这是本次最值得记的一条）：
+
+- 第 59 组前 7 条用 `readFileSync` + 正则匹配 `index.js` 的**源码文本** → 改个变量名就红，逻辑改错不红；
+- 后 3 条行为级测试，测的是**在测试文件里重新手写的循环副本**（旧 `regress.mjs:1687-1708`），
+  跟真实代码毫无绑定 → `index.js` 改坏了它照样绿。
+
+根因：那段逻辑内联在 `apply()` 闭包里，外部拿不到。现在抽成 `lib/tool-register.js`，
+导出 `createToolRegistrar()`，测试直接 import 真模块喂假 `ctx`/假 `tools`。
+
+### 判据（第 59 组，28 项全部行为级）
+
+覆盖：一次全成功 / bug① 部分失败不完成且精确指出缺谁 / bug① 恢复后只补缺失项 /
+bug② 未就绪 50 轮 attempts 仍为 0 / bug② 服务晚到仍能注册 / 未就绪上限与放弃日志 /
+「已存在」算成功且不刷日志 / 真失败达上限写清名单 / 定时器登记进 `ctx.effect` /
+`tools/change` 不消耗 attempts / 定义生成抛错不假装完成。
+
+### 反向验证（证明新测试真有区分力）
+
+- 把 bug① 改回去（`missingNames().length === 0` → `done.size > 0`）→ **7 项转红**；
+- 把 bug② 改回去（未就绪分支加 `attempts++`）→ **4 项转红**；
+- 恢复后复跑 → **808/808 全通过**。
+
+### 生效方式与回滚
+
+- link 接入，**需重启 DSH 生效**。重启后查 `mind.log`：
+  正常应见一行 `mind_* 工具已注册 :: 7/7 个（第 N 次尝试）`；
+  若见 `工具注册放弃 :: ... 仍未注册 N 个 :: <名字>`，说明有工具真失败，日志会直接点名。
+- 回滚：两份 `.bak-toolreg-20261120-012400` 覆盖回去即可（`lib/tool-register.js` 届时无人 import，无副作用）。
+
+---
+
+## 未发布 — 2026-11-16 晚（体检 A5/A6/A7：垃圾桶接线、旧纸条标龄、报表补列）
+
+回归 **791/791 通过**（新增 17 项判据），输出 `dsh-optimize/mind-regress-20261116-a5a6a7.out`。备份 `lib/{index,tool-ledger,state}.js.bak-a5a6a7-20261116`。
+
+### A5 · 死会话账本清理（启动按龄期，**不挂 disposed**）
+
+- **血证**：`clearSession()` 写好后全库零调用，账本按会话累格只进不出（真机半天 2 格→6 格）。
+- **第一版修法（已作废）**：disposed 即清 + 启动 7 天兜底。**19:41 重启验收时推翻**：本宿主同一 session 的 agent 每次重启都 disposed 再 created（真机日志 19:35:49 disposed 80e900… → 19:36:09 同 id created）——照那版，每次重启都会抹掉当前会话的账本，恰好毁掉「跨压缩/跨重启存活」这个立身之本。**幸好当时 psyche 关闭、验收用的又是新进程，历史实际未被清**（6 格全在，最后动静时间核对过）。
+- **最终修法**：清理只走启动时 `sweepSessions(maxAgeMs=7天)`——判据是**格内最后一条动静**的龄期，活会话（含刚重启回来的）绝不动。`clearSession` 保留给显式清理场景（CLI/测试），注释写明不许挂 disposed。
+- 与存档清理的边界：存档是原文唯一备份→只报告不删；账本只是流水索引（原文另有存档）→可按龄期真删。
+- 顺手修：`index.js:83` / `state.js:25`「disposed 从未触发过」的过时注释（本轮日志实测多次触发）。
+- **判据**：91-⑩ 组 6 项，其中「disposed 真接线」已反转为「**disposed 不许清账本**」（重启≠会话死亡）。
+
+### A6 · 陈旧追求句标龄（只标注，不自动关）
+
+- **血证**：3 条未结追求停在 9~12 天前且互相矛盾（同一件事的「已完成/进行中/刚开工」三个阶段快照），被原样注入每个窗口、写进日记。
+- **修法**：`io.js` 新增 `pursuitStaleNote(at, now)`——≥3 天未更新返回「（N 天未更新，可能已完成或已放弃；确认后用 mind_intend {close} 关掉）」，否则空串。接到**三个出口**：psyche 注入段（renderPursuits）、压缩前日记（composeDiary）、mind_view（stale 字段）。
+- ⚠️ 刻意不自动 close：陈旧≠完成，自动关会误杀长任务（反例已写进注释与测试）。
+- 数据卫生：三条陈旧追求已用 mind_intend {close} 显式关闭（cctriua1/bsgocjl2/8m5urfdi），当前未结 1 条（本轮体检修复主线）。
+- **判据**：93-①②③④ 组 10 项（门槛两侧/坏输入/注入带警示/新鲜不误报/不自动关/日记带警示/mind_view 字段）。
+
+### A7 · injected 日志补 led= 字段
+
+- **血证**：段明细 `[life= psy= dia= tac=]` 漏了 ledger——账本注入量在日志里不可见（14:43 那次实际注入 1000+ 字符账本，日志无痕）。
+- **修法**：格式串补 `led=${segments.ledger.length}`，五段齐全。
+- **判据**：93-⑤（源码级钉住字段顺序）。
+
+### 生效方式与回滚
+
+- link 接入，**需重启 DSH 生效**。19:41 重启验收：✅ injected 日志出现 `led=804`（A7 生效独有证据）；✅ mind_view pursuits 带 `stale` 字段（A6 生效独有证据）；✅ 账本新条目带一句话摘要（注入可见「跑回归测试验证…」等）。A5 最终版（仅启动 sweep）待下次重启看「启动清理账本」日志——当前 6 格全部 7 天内有动静，**不清才是正确行为**，真删要等首个格满 7 天（最早 11-23）。
+- 回滚：三份 `.bak-a5a6a7-20261116` 覆盖即可（io.js/psyche.js/diary.js/tools.js 的改动为纯增量函数与一行接线，回滚 index/tool-ledger/state 三份后其余新增函数无人调用、无副作用）。
+
+---
+
+## 未发布 — 2026-11-16（体检 A1/A2：两处「写了却没接线」）
+
+取证：`dsh-optimize/recon-2026-11-16-mind-audit.md`。回归 **774/774 通过**（新增 14 项判据），输出 `dsh-optimize/mind-regress-20261116-a1a2.out`。
+
+### A1 · lifeline 的 rebuildEveryMs 从死配置变成真消费
+
+- **血证**：`config.js` 定义 `rebuildEveryMs: 6h`、`index.js` 注释承诺定时重建，但实现只有「渲染为空才 rebuild」——该键全库零消费，`builtAt` 只写不读。索引建一次后**永不更新**，新日记静默进不了月索引。
+- **修法**：`lifeline.js` 新增 `rebuildDue(everyMs, now)`（读 builtAt 判龄期；无/坏 builtAt 或非法间隔一律保守判到期）；`index.js` 注入路径改为先问 `rebuildDue` 再决定 rebuild，重建留日志（含原因）。
+- 顺手修：注入文案 `mind_lifeline {expand:"YYYY-MM"}` → `{ym:"YYYY-MM"}`（真实参数是 ym，expand 会被忽略落到列目录分支）。
+- **判据**：第 90-⑫ 组 5 项（fresh 不到期 / aged 到期 / 非法间隔保守 / index.js 真消费 / 文案参数名一致）。
+- 真机只读验证：`rebuildDue(6h)` 对真实索引返回 `{due:false, reason:'fresh', ageMs:5763333}`；渲染尾部已是 `{ym:"YYYY-MM"}`。
+
+### A2 · 工具账本的「一句话摘要」从恒空变成真生成
+
+- **血证**：设计承诺「工具名+成败+大小+一句话」，但 pre 不传 summary、settle 不补——真机 35 条 summary 全空。压缩后账本答不出「查的是什么」。
+- **修法**：`tool-ledger.js` 新增 `summarizeArgs(tool, args, maxChars)`——确定性字段表提取（description > file_path/path 尾段+动词 > pattern/query > url > name > prompt 首行），提取不到返回空串不编；`index.js` pre-execute 记账时传入。settle 用 spread 保留原条目，摘要天然不被冲掉（有判据钉住）。
+- 顺手修：render 省略脚注不再指「用 mind_search 搜关键词」——账本不在压缩存档里，那是走不通的路。
+- **判据**：第 91-⑨ 组 9 项（提取优先级/截断/坏入参不抛/settle 后摘要仍在/渲染带出/脚注不指错路）。
+- 真机只读验证：`summarizeArgs('pwsh', {description:'查看 mind.log 大小与最近日志'})` → 原样返回。
+
+### 生效方式与回滚
+
+- profile 以 `link:<本包路径>` 接入，**改源码即改安装位**；插件代码常驻内存，**需重启 DSH 才生效**（重启后看 mind.log 出现「生命索引已重建 :: …原因 aged」与账本新条目带 summary 即为生效证据）。
+- 回滚：`lib/{lifeline,index,tool-ledger}.js.bak-a1a2-20261116` 三份备份原样覆盖即可。
+- ⚠️ 重启前的过渡期：注入文案仍是旧的 expand 写法（内存里是旧代码），下一回合看到 `{ym:…}` 才是新代码生效。
+
+---
+
 ## v1.0.3 — 2026-11-12（日志说实话：34 次「失败」里没有一次是故障）
 
 ### 一句话
